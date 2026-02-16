@@ -2,7 +2,7 @@ const std = @import("std");
 const wasm = @import("wasm");
 const llvm = @import("llvm");
 
-const conv = @import("../conversions.zig");
+const conv = @import("conversions.zig");
 const code = @import("code.zig");
 
 const Context = @import("../Context.zig");
@@ -45,16 +45,16 @@ pub const CodegenBuilder = struct {
         );
     }
 
-    fn compileFunc(ptr: *anyopaque, type_idx: u32, idx: u32) !void {
+    fn compileFunc(ptr: *anyopaque, type_idx: u32, _: u32) !void {
         const self: *CodegenBuilder = @ptrCast(@alignCast(ptr));
         const functype = self.ctx.functypes.items[type_idx];
         const func = core.LLVMAddFunction(self.ctx.module, "", functype);
-        try self.ctx.registry.put(self.ctx.allocator, .{ .function = idx }, func);
+        try self.ctx.funcs.append(self.ctx.allocator, func);
     }
 
     fn compileCode(ptr: *anyopaque, body: wasm.types.FuncBody, idx: u32) !void {
         const self: *CodegenBuilder = @ptrCast(@alignCast(ptr));
-        const func = self.ctx.registry.get(.{ .function = idx - self.ctx.counts.imported_funcs }).?;
+        const func = self.ctx.funcs.items[idx - self.ctx.counts.imported_funcs];
         try code.CodeCompiler.compile(self.ctx, func, body);
     }
 
@@ -62,7 +62,7 @@ pub const CodegenBuilder = struct {
         const self: *CodegenBuilder = @ptrCast(@alignCast(ptr));
         switch (exp.kind) {
             .func => |func_idx| {
-                const func = self.ctx.registry.get(.{ .function = func_idx }).?;
+                const func = self.ctx.funcs.items[func_idx];
                 core.LLVMSetLinkage(func, types.LLVMLinkage.LLVMExternalLinkage);
                 core.LLVMSetValueName2(func, @ptrCast(exp.name), exp.name.len);
             },

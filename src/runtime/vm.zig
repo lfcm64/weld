@@ -37,9 +37,7 @@ pub const VmContextBuilder = struct {
     tables: std.ArrayList(Table) = .{},
 
     pub fn init(allocator: Allocator) VmContextBuilder {
-        return .{
-            .allocator = allocator,
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *VmContextBuilder) void {

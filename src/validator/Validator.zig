@@ -32,27 +32,27 @@ const ValidationVisitor = struct {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &.{
-                .visitType = visitType,
-                .visitImport = visitImport,
-                .visitFunc = visitFunc,
-                .visitTable = visitTable,
-                .visitMemory = visitMemory,
-                .visitGlobal = visitGlobal,
-                .visitExport = visitExport,
-                .visitStart = visitStart,
-                .visitElem = visitElem,
-                .visitCode = visitCode,
-                .visitData = visitData,
+                .visitType = validateType,
+                .visitImport = validateImport,
+                .visitFunc = validateFunc,
+                .visitTable = validateTable,
+                .visitMemory = validateMemory,
+                .visitGlobal = validateGlobal,
+                .visitExport = validateExport,
+                .visitStart = validateStart,
+                .visitElem = validateElem,
+                .visitCode = validateCode,
+                .visitData = validateData,
             },
         };
     }
 
-    fn visitType(ptr: *anyopaque, ty: types.FuncType, _: u32) !void {
+    fn validateType(ptr: *anyopaque, ty: types.FuncType, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         try self.ctx.addFuncType(ty);
     }
 
-    fn visitImport(ptr: *anyopaque, import: types.Import, _: u32) !void {
+    fn validateImport(ptr: *anyopaque, import: types.Import, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         switch (import.desc) {
             .func => |type_idx| if (type_idx >= self.ctx.functypes.items.len) return error.FuncIndexOutOfBounds,
@@ -63,31 +63,31 @@ const ValidationVisitor = struct {
         try self.ctx.addImport(import);
     }
 
-    fn visitFunc(ptr: *anyopaque, type_idx: indices.Func, _: u32) !void {
+    fn validateFunc(ptr: *anyopaque, type_idx: indices.Func, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         if (type_idx >= self.ctx.functypes.items.len) return error.FuncIndexOutOfBounds;
         try self.ctx.addFunc(type_idx);
     }
 
-    fn visitTable(ptr: *anyopaque, table: types.Table, _: u32) !void {
+    fn validateTable(ptr: *anyopaque, table: types.Table, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         try verifyTable(table);
         try self.ctx.addTable(table);
     }
 
-    fn visitMemory(ptr: *anyopaque, mem: types.Memory, _: u32) !void {
+    fn validateMemory(ptr: *anyopaque, mem: types.Memory, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         try verifyMemory(mem);
         try self.ctx.addMemory(mem);
     }
 
-    fn visitGlobal(ptr: *anyopaque, global: types.Global, _: u32) !void {
+    fn validateGlobal(ptr: *anyopaque, global: types.Global, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
-        try validateConstExpr(self.ctx, global.init_expr, global.ty.valtype);
+        try verifyConstExpr(self.ctx, global.init_expr, global.ty.valtype);
         try self.ctx.addGlobal(global);
     }
 
-    fn visitExport(ptr: *anyopaque, exp: types.Export, _: u32) !void {
+    fn validateExport(ptr: *anyopaque, exp: types.Export, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         switch (exp.kind) {
             .func => |func_idx| if (func_idx >= self.ctx.funcs.items.len) return error.ExportFuncIndexOutOfBounds,
@@ -98,15 +98,15 @@ const ValidationVisitor = struct {
         try self.ctx.addExport(exp);
     }
 
-    fn visitStart(ptr: *anyopaque, start: wasm.indices.Func) !void {
+    fn validateStart(ptr: *anyopaque, start: wasm.indices.Func) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         if (start >= self.ctx.funcs.items.len) return error.StartFuncIndexOutOfBounds;
     }
 
-    fn visitElem(ptr: *anyopaque, elem: types.Element, _: u32) !void {
+    fn validateElem(ptr: *anyopaque, elem: types.Element, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         if (elem.table_idx >= self.ctx.tables.items.len) return error.TableIndexOutOfBounds;
-        try validateConstExpr(self.ctx, elem.offset, .i32);
+        try verifyConstExpr(self.ctx, elem.offset, .i32);
 
         const func_count = self.ctx.funcs.items.len;
         var it = elem.indices.iter();
@@ -115,18 +115,18 @@ const ValidationVisitor = struct {
         }
     }
 
-    fn visitCode(ptr: *anyopaque, body: types.FuncBody, idx: u32) !void {
+    fn validateCode(ptr: *anyopaque, body: types.FuncBody, idx: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         try code.validateCode(self.ctx, body, idx);
     }
 
-    fn visitData(ptr: *anyopaque, data: types.Segment, _: u32) !void {
+    fn validateData(ptr: *anyopaque, data: types.Segment, _: u32) !void {
         const self: *ValidationVisitor = @ptrCast(@alignCast(ptr));
         if (data.mem_idx >= self.ctx.memories.items.len) return error.MemoryIndexOutOfBounds;
-        try validateConstExpr(self.ctx, data.offset, .i32);
+        try verifyConstExpr(self.ctx, data.offset, .i32);
     }
 
-    fn validateConstExpr(ctx: *Context, expr: types.Expr, expected_type: types.ValType) !void {
+    fn verifyConstExpr(ctx: *Context, expr: types.Expr, expected_type: types.ValType) !void {
         switch (expr) {
             .i32 => if (expected_type != .i32) return error.ConstExprTypeMismatch,
             .i64 => if (expected_type != .i64) return error.ConstExprTypeMismatch,

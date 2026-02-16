@@ -10,7 +10,7 @@ const types = wasm.types;
 const SectionType = wasm.sections.SectionType;
 const Section = wasm.sections.Section;
 
-pub const IncrementalParser = struct {
+pub const Parser = struct {
     source: []const u8,
     reader: io.Reader,
 
@@ -22,14 +22,14 @@ pub const IncrementalParser = struct {
         section: SectionType,
     };
 
-    pub fn init(source: []const u8) IncrementalParser {
+    pub fn init(source: []const u8) Parser {
         return .{
             .source = source,
             .reader = io.Reader.fixed(source),
         };
     }
 
-    pub fn parseNext(self: *IncrementalParser) !?Payload {
+    pub fn parseNext(self: *Parser) !?Payload {
         if (self.reader.seek == self.source.len) return null;
 
         switch (self.state) {
@@ -63,7 +63,7 @@ pub const IncrementalParser = struct {
 
 pub fn parseAll(source: []const u8) !Ast {
     var ast = Ast{};
-    var ip = IncrementalParser.init(source);
+    var ip = Parser.init(source);
 
     while (try ip.parseNext()) |payload| switch (payload) {
         .module_header => |h| {

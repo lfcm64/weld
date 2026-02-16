@@ -14,12 +14,6 @@ const Allocator = std.mem.Allocator;
 const Value = types.LLVMValueRef;
 const Type = types.LLVMTypeRef;
 
-pub const Symbol = union(enum) {
-    global: u32,
-    function: u32,
-};
-pub const SymbolRegistry = std.AutoHashMapUnmanaged(Symbol, Value);
-
 pub const CompilerCounts = struct {
     imported_funcs: u32 = 0,
 };
@@ -29,8 +23,8 @@ allocator: Allocator,
 module: types.LLVMModuleRef,
 context: types.LLVMContextRef,
 
-registry: SymbolRegistry = .{},
 functypes: std.ArrayList(Type) = .{},
+funcs: std.ArrayList(Value) = .{},
 
 intrinsics: Intrinsics,
 stubs: Stubs,
@@ -55,5 +49,5 @@ pub fn init(allocator: Allocator, tsctx: orc.LLVMOrcThreadSafeContextRef) !Conte
 
 pub fn deinit(self: *Context) void {
     self.functypes.deinit(self.allocator);
-    self.registry.deinit(self.allocator);
+    self.funcs.deinit(self.allocator);
 }

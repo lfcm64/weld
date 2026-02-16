@@ -1,7 +1,7 @@
 const std = @import("std");
 const llvm = @import("llvm");
 const wasm = @import("wasm");
-const conv = @import("../conversions.zig");
+const conv = @import("conversions.zig");
 
 const State = @import("State.zig");
 
@@ -313,7 +313,7 @@ pub const CodeCompiler = struct {
                 },
 
                 .call => |func_idx| {
-                    const callee = ctx.registry.get(.{ .function = func_idx }).?;
+                    const callee = ctx.funcs.items[func_idx];
                     const callee_type = core.LLVMGlobalGetValueType(callee);
 
                     const param_count = core.LLVMCountParams(callee);
@@ -384,15 +384,15 @@ pub const CodeCompiler = struct {
                     try state.push(allocator, val);
                 },
 
-                .@"global.get" => |global_idx| {
-                    const global = ctx.registry.get(.{ .global = global_idx }).?;
-                    try state.push(allocator, global);
-                },
+                //.@"global.get" => |global_idx| {
+                //    const global = ctx.registry.get(.{ .global = global_idx }).?;
+                //    try state.push(allocator, global);
+                //},
 
-                .@"global.set" => |global_idx| {
-                    const val = state.pop().?;
-                    _ = core.LLVMBuildStore(builder, val, ctx.registry.get(.{ .global = global_idx }).?);
-                },
+                //.@"global.set" => |global_idx| {
+                //    const val = state.pop().?;
+                //    _ = core.LLVMBuildStore(builder, val, ctx.registry.get(.{ .global = global_idx }).?);
+                //},
 
                 .@"i32.load" => |mem_arg| {
                     const addr = state.pop().?;

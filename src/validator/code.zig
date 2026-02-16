@@ -71,19 +71,11 @@ pub const State = struct {
     }
 };
 
-fn createLocals(allocator: Allocator, body: types.FuncBody) ![]ValType {
-    var locals: std.ArrayList(ValType) = .{};
-
-    var it = body.locals.iter();
-    while (try it.next()) |local| try locals.appendNTimes(allocator, local.valtype, local.count);
-    return locals.toOwnedSlice(allocator);
-}
-
 pub fn validateCode(ctx: *Context, body: types.FuncBody, func_idx: u32) !void {
     const allocator = ctx.allocator;
     const func_type = ctx.typeOfFunc(ctx.imported_funcs + func_idx);
 
-    const locals = try createLocals(ctx.allocator, body);
+    const locals = try body.collectLocals(ctx.allocator);
     defer ctx.allocator.free(locals);
 
     var state = State{};

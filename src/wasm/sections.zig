@@ -64,19 +64,3 @@ pub const StartSection = struct {
         return .{ .func_idx = try reader.takeLeb128(u32) };
     }
 };
-
-pub fn SectionItem(section_type: SectionType) type {
-    return switch (section_type) {
-        .type => types.FuncType,
-        .import => types.Import,
-        .func => u32,
-        .table => types.Table,
-        .memory => types.Memory,
-        .global => types.Global,
-        .@"export" => types.Export,
-        .elem => types.Element,
-        .code => types.FuncBody,
-        .data => types.Segment,
-        else => unreachable,
-    };
-}

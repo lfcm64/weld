@@ -6,6 +6,7 @@ const Vec = @import("vecs.zig").Vec;
 
 const io = std.io;
 
+const Allocator = std.mem.Allocator;
 const Instruction = instr.Instruction;
 
 pub const Header = struct {
@@ -235,6 +236,14 @@ pub const FuncBody = struct {
             .locals = locals,
             .code = code,
         };
+    }
+
+    pub fn collectLocals(self: FuncBody, allocator: Allocator) ![]ValType {
+        var locals: std.ArrayList(ValType) = .{};
+
+        var it = self.locals.iter();
+        while (try it.next()) |local| try locals.appendNTimes(allocator, local.valtype, local.count);
+        return locals.toOwnedSlice(allocator);
     }
 };
 
