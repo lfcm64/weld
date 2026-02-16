@@ -2,69 +2,64 @@ const Instance = @This();
 
 const std = @import("std");
 const llvm = @import("llvm");
-const vm = @import("vm.zig");
+const wasm = @import("wasm");
 
-const engine = llvm.engine;
-const types = llvm.types;
-const core = llvm.core;
-const target = llvm.target;
+const Vm = @import("vm.zig");
+
+const Module = @import("../Module.zig");
+const Ast = @import("../parser/Ast.zig");
+
+const orc = llvm.orc;
+const jit = llvm.jit;
+const errors = llvm.errors;
 
 const Allocator = std.mem.Allocator;
 
-module: types.LLVMModuleRef,
-eng: types.LLVMExecutionEngineRef,
-vmctx: vm.VmCtx,
+allocator: Allocator,
+module: Module,
+vm: Vm.VmContext,
 
-pub fn init(allocator: Allocator, module: types.LLVMModuleRef) !Instance {
-    _ = target.LLVMInitializeNativeTarget();
-    _ = target.LLVMInitializeNativeAsmPrinter();
-    _ = target.LLVMInitializeNativeAsmParser();
+pub fn init(allocator: Allocator, module: Module) !Instance {
+    const es = jit.LLVMOrcLLJITGetExecutionSession(module.code.lljit);
 
-    _ = engine.LLVMLinkInMCJIT();
+    const flags = orc.LLVMJITSymbolFlags{
+        .GenericFlags = @intFromEnum(orc.LLVMJITSymbolGenericFlags.LLVMJITSymbolGenericFlagsExported) |
+            @intFromEnum(orc.LLVMJITSymbolGenericFlags.LLVMJITSymbolGenericFlagsCallable),
+        .TargetFlags = 0,
+    };
 
-    var error_msg: [*c]u8 = undefined;
+    var pairs = [_]orc.LLVMOrcCSymbolMapPair{
+        .{ .Name = orc.LLVMOrcExecutionSessionIntern(es, "get_i8"), .Sym = .{ .Address = @intFromPtr(&Vm.get_i8), .Flags = flags } },
+        .{ .Name = orc.LLVMOrcExecutionSessionIntern(es, "set_i8"), .Sym = .{ .Address = @intFromPtr(&Vm.set_i8), .Flags = flags } },
+        .{ .Name = orc.LLVMOrcExecutionSessionIntern(es, "get_i16"), .Sym = .{ .Address = @intFromPtr(&Vm.get_i16), .Flags = flags } },
+        .{ .Name = orc.LLVMOrcExecutionSessionIntern(es, "set_i16"), .Sym = .{ .Address = @intFromPtr(&Vm.set_i16), .Flags = flags } },
+    };
 
-    if (llvm.analysis.LLVMVerifyModule(
-        module,
-        types.LLVMVerifierFailureAction.LLVMReturnStatusAction,
-        &error_msg,
-    ) != 0) {
-        std.debug.print("Module invalid: {s}\n", .{error_msg});
-        defer core.LLVMDisposeMessage(error_msg);
-
-        const module_str = core.LLVMPrintModuleToString(module);
-        defer core.LLVMDisposeMessage(module_str);
-
-        std.debug.print("{s}\n", .{module_str});
-        return error.CompilationError;
+    const mu = orc.LLVMOrcAbsoluteSymbols(&pairs, pairs.len);
+    const err = orc.LLVMOrcJITDylibDefine(module.code.dylib, mu);
+    if (err != null) {
+        errors.LLVMConsumeError(err);
+        return error.LlvmError;
     }
 
-    var eng: types.LLVMExecutionEngineRef = undefined;
-
-    if (engine.LLVMCreateExecutionEngineForModule(&eng, module, &error_msg) != 0) {
-        core.LLVMDisposeMessage(error_msg);
-        return error.ExecutionEngineError;
-    }
-
-    const set_i32_fn = core.LLVMGetNamedFunction(module, "set_i32");
-    if (set_i32_fn != null) {
-        engine.LLVMAddGlobalMapping(eng, set_i32_fn, @constCast(&vm.set_i32));
-    }
     return .{
+        .allocator = allocator,
         .module = module,
-        .eng = eng,
-        .vmctx = try vm.VmCtx.init(allocator),
+        .vm = try Vm.VmContext.init(allocator, module.parsed),
     };
 }
 
 pub fn deinit(self: *Instance) void {
-    engine.LLVMDisposeExecutionEngine(self.eng);
-    self.vmctx.deinit();
+    self.vm.deinit();
 }
 
-pub fn getFunction(self: *Instance, comptime func_name: []const u8, comptime Fn: type) !Fn {
-    const func_addr = engine.LLVMGetFunctionAddress(self.eng, @ptrCast(func_name));
-    if (func_addr == 0) return error.FunctionNotFound;
+pub fn getFunction(self: *Instance, comptime name: [:0]const u8, comptime Fn: type) !Fn {
+    var addr: orc.LLVMOrcExecutorAddress = 0;
+    const err = jit.LLVMOrcLLJITLookup(self.module.code.lljit, &addr, name.ptr);
+    if (err != null) {
+        errors.LLVMConsumeError(err);
+        return error.LlvmError;
+    }
 
-    return @ptrFromInt(func_addr);
+    return @ptrFromInt(addr);
 }

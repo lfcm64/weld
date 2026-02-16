@@ -55,6 +55,9 @@ pub const Stubs = struct {
     fn createStub(self: *Stubs, comptime kind: StubKind) types.LLVMValueRef {
         const name = @tagName(kind);
         const void_ty = core.LLVMVoidTypeInContext(self.ctx);
+
+        const i8_ty = core.LLVMInt8TypeInContext(self.ctx);
+        const i16_ty = core.LLVMInt16TypeInContext(self.ctx);
         const i32_ty = core.LLVMInt32TypeInContext(self.ctx);
         const i64_ty = core.LLVMInt64TypeInContext(self.ctx);
         const f32_ty = core.LLVMFloatTypeInContext(self.ctx);
@@ -89,10 +92,17 @@ pub const Stubs = struct {
                 break :blk core.LLVMFunctionType(f64_ty, &params, 2, 0);
             },
 
-            .set_i8,
-            .set_i16,
-            .set_i32,
-            => blk: {
+            .set_i8 => blk: {
+                var params = [_]types.LLVMTypeRef{ ptr_ty, i32_ty, i8_ty };
+                break :blk core.LLVMFunctionType(void_ty, &params, 3, 0);
+            },
+
+            .set_i16 => blk: {
+                var params = [_]types.LLVMTypeRef{ ptr_ty, i32_ty, i16_ty };
+                break :blk core.LLVMFunctionType(void_ty, &params, 3, 0);
+            },
+
+            .set_i32 => blk: {
                 var params = [_]types.LLVMTypeRef{ ptr_ty, i32_ty, i32_ty };
                 break :blk core.LLVMFunctionType(void_ty, &params, 3, 0);
             },

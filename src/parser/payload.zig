@@ -1,11 +1,10 @@
 const wasm = @import("wasm");
 
-const sections = wasm.sections;
 const types = wasm.types;
 
-const Section = sections.Section;
+const Section = wasm.sections.Section;
 
-pub const Event = union(enum) {
+pub const Payload = union(enum) {
     module_header: types.Header,
     custom_section: Section(.custom),
     type_section: Section(.type),

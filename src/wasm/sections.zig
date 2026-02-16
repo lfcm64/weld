@@ -2,7 +2,7 @@ const std = @import("std");
 
 const types = @import("types.zig");
 const indices = @import("indices.zig");
-const SizedVec = @import("vecs.zig").SizedVec;
+const Vec = @import("vecs.zig").Vec;
 
 const io = std.io;
 
@@ -24,17 +24,17 @@ pub const SectionType = enum(u8) {
 pub fn Section(comptime section_type: SectionType) type {
     return switch (section_type) {
         .custom => CustomSection,
-        .type => SizedVec(types.FuncType),
-        .import => SizedVec(types.Import),
-        .func => SizedVec(u32),
-        .table => SizedVec(types.Table),
-        .memory => SizedVec(types.Memory),
-        .global => SizedVec(types.Global),
-        .@"export" => SizedVec(types.Export),
+        .type => Vec(types.FuncType),
+        .import => Vec(types.Import),
+        .func => Vec(u32),
+        .table => Vec(types.Table),
+        .memory => Vec(types.Memory),
+        .global => Vec(types.Global),
+        .@"export" => Vec(types.Export),
         .start => StartSection,
-        .elem => SizedVec(types.Element),
-        .code => SizedVec(types.FuncBody),
-        .data => SizedVec(types.Segment),
+        .elem => Vec(types.Element),
+        .code => Vec(types.FuncBody),
+        .data => Vec(types.Segment),
     };
 }
 
@@ -42,7 +42,7 @@ const CustomSection = struct {
     name: []const u8,
     bytes: []const u8,
 
-    pub fn fromReader(reader: *io.Reader) !CustomSection {
+    pub fn fromReaderSized(reader: *io.Reader) !CustomSection {
         _ = try reader.takeLeb128(u32);
         const name_size = try reader.takeLeb128(u32);
         const name = try reader.take(name_size);
@@ -57,10 +57,10 @@ const CustomSection = struct {
     }
 };
 
-const StartSection = struct {
+pub const StartSection = struct {
     func_idx: indices.Func,
 
-    pub fn fromReader(reader: *io.Reader) !StartSection {
+    pub fn fromReaderSized(reader: *io.Reader) !StartSection {
         return .{ .func_idx = try reader.takeLeb128(u32) };
     }
 };

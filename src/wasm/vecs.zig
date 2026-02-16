@@ -16,9 +16,7 @@ pub fn Vec(comptime T: type) type {
             for (0..count) |_| {
                 _ = switch (T) {
                     u32 => try reader.takeLeb128(u32),
-                    else => if (@hasDecl(T, "fromReader")) try T.fromReader(reader) else {
-                        @compileError("Type must be u32 or have fromReader method");
-                    },
+                    else => try T.fromReader(reader),
                 };
             }
             return .{
@@ -27,21 +25,7 @@ pub fn Vec(comptime T: type) type {
             };
         }
 
-        pub fn iter(self: *const @This()) Iterator(T) {
-            return .{
-                .reader = io.Reader.fixed(self.bytes),
-                .remaining = self.count,
-            };
-        }
-    };
-}
-
-pub fn SizedVec(comptime T: type) type {
-    return struct {
-        bytes: []const u8,
-        count: u32,
-
-        pub fn fromReader(reader: *io.Reader) !@This() {
+        pub fn fromReaderSized(reader: *io.Reader) !@This() {
             const size = try reader.takeLeb128(u32);
             const pos = reader.seek;
             const count = try reader.takeLeb128(u32);
@@ -51,11 +35,44 @@ pub fn SizedVec(comptime T: type) type {
             };
         }
 
+        pub fn collect(self: *const @This(), allocator: Allocator) ![]T {
+            var list = try std.ArrayList(T).initCapacity(allocator, self.count);
+            errdefer list.deinit(allocator);
+
+            var it = self.iter();
+            while (try it.next()) |item| list.appendAssumeCapacity(item);
+            return list.toOwnedSlice(allocator);
+        }
+
         pub fn iter(self: *const @This()) Iterator(T) {
             return .{
                 .reader = io.Reader.fixed(self.bytes),
                 .remaining = self.count,
             };
+        }
+
+        pub fn forEach(
+            self: *const @This(),
+            ctx: anytype,
+            callback: *const fn (@TypeOf(ctx), item: T) anyerror!void,
+        ) !void {
+            var it = self.iter();
+            while (try it.next()) |item| {
+                try callback(ctx, item);
+            }
+        }
+
+        pub fn forEachWithIndex(
+            self: *const @This(),
+            ctx: anytype,
+            callback: *const fn (@TypeOf(ctx), item: T, idx: u32) anyerror!void,
+        ) !void {
+            var it = self.iter();
+            var idx: u32 = 0;
+            while (try it.next()) |item| {
+                try callback(ctx, item, idx);
+                idx += 1;
+            }
         }
     };
 }
@@ -74,9 +91,7 @@ pub fn Iterator(comptime T: type) type {
 
             return switch (T) {
                 u32 => try self.reader.takeLeb128(u32),
-                else => if (@hasDecl(T, "fromReader")) try T.fromReader(&self.reader) else {
-                    @compileError("Type must be u32 or have fromReader method");
-                },
+                else => try T.fromReader(&self.reader),
             };
         }
     };

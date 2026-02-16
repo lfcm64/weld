@@ -1,9 +1,13 @@
 const std = @import("std");
 const llvm = @import("llvm");
 const wasm = @import("wasm");
-const conv = @import("../convertions.zig");
+const conv = @import("../conversions.zig");
+
+const State = @import("State.zig");
 
 const Intrinsics = @import("intrinsics.zig").Intrinsics;
+const Stubs = @import("stubs.zig").Stubs;
+
 const Context = @import("../Context.zig");
 
 const Allocator = std.mem.Allocator;
@@ -15,94 +19,6 @@ const core = llvm.core;
 const Value = types.LLVMValueRef;
 const BasicBlock = types.LLVMBasicBlockRef;
 
-pub const ControlFrame = union(enum) {
-    block: struct {
-        next: BasicBlock,
-        phi: ?Value,
-    },
-
-    loop: struct {
-        header: BasicBlock,
-        next: BasicBlock,
-        loop_phi: ?Value,
-        phi: ?Value,
-    },
-
-    if_else: struct {
-        then: BasicBlock,
-        @"else": BasicBlock,
-        has_else: bool = false,
-        next: BasicBlock,
-        phi: ?Value,
-    },
-
-    pub fn next(self: *const ControlFrame) BasicBlock {
-        return switch (self.*) {
-            .block => |block| block.next,
-            .loop => |loop| loop.next,
-            .if_else => |ie| ie.next,
-        };
-    }
-
-    pub fn brDest(self: *const ControlFrame) BasicBlock {
-        return switch (self.*) {
-            .block => |block| block.next,
-            .loop => |loop| loop.header,
-            .if_else => |ie| ie.next,
-        };
-    }
-
-    pub fn phi(self: *const ControlFrame) ?Value {
-        return switch (self.*) {
-            .block => |block| block.phi,
-            .loop => |loop| loop.loop_phi,
-            .if_else => |ie| ie.phi,
-        };
-    }
-};
-
-pub const State = struct {
-    stack: std.ArrayList(Value) = .{},
-    ctrl_stack: std.ArrayList(ControlFrame) = .{},
-    reachable: bool = true,
-
-    pub fn deinit(self: *State, allocator: Allocator) void {
-        self.stack.deinit(allocator);
-        self.ctrl_stack.deinit(allocator);
-    }
-
-    pub fn push(self: *State, allocator: Allocator, value: Value) !void {
-        try self.stack.append(allocator, value);
-    }
-
-    pub fn pop(self: *State) ?Value {
-        return self.stack.pop();
-    }
-
-    pub fn peek(self: *const State) ?Value {
-        if (self.stack.items.len == 0) return null;
-        return self.stack.items[self.stack.items.len - 1];
-    }
-
-    pub fn pushFrame(self: *State, allocator: std.mem.Allocator, frame: ControlFrame) !void {
-        try self.ctrl_stack.append(allocator, frame);
-    }
-
-    pub fn popFrame(self: *State) ?ControlFrame {
-        return self.ctrl_stack.pop();
-    }
-
-    pub fn frameAtDepth(self: *State, depth: usize) ?*ControlFrame {
-        if (depth >= self.ctrl_stack.items.len) return null;
-        return &self.ctrl_stack.items[self.ctrl_stack.items.len - 1 - depth];
-    }
-
-    pub fn currentFrame(self: *State) ?*ControlFrame {
-        if (self.ctrl_stack.items.len == 0) return null;
-        return &self.ctrl_stack.items[self.ctrl_stack.items.len - 1];
-    }
-};
-
 fn createLocals(ctx: *Context, body: wasm.types.FuncBody, builder: types.LLVMBuilderRef) ![]Value {
     var locals: std.ArrayList(Value) = .{};
     errdefer locals.deinit(ctx.allocator);
@@ -110,7 +26,7 @@ fn createLocals(ctx: *Context, body: wasm.types.FuncBody, builder: types.LLVMBui
     var it = body.locals.iter();
 
     while (try it.next()) |local| {
-        const llvm_type = conv.typeToLLVM(local.valtype, ctx.llvm_context);
+        const llvm_type = conv.typeToLLVM(local.valtype, ctx.context);
         const zero = core.LLVMConstNull(llvm_type);
 
         for (0..local.count) |_| {
@@ -125,13 +41,12 @@ fn createLocals(ctx: *Context, body: wasm.types.FuncBody, builder: types.LLVMBui
 pub const CodeCompiler = struct {
     pub fn compile(
         ctx: *Context,
+        func: types.LLVMValueRef,
         body: wasm.types.FuncBody,
-        idx: u32,
     ) !void {
-        const llvm_ctx = ctx.llvm_context;
+        const llvm_ctx = ctx.context;
         const allocator = ctx.allocator;
 
-        const func = ctx.funcs.items[ctx.imported_funcs + idx];
         const func_type = core.LLVMGlobalGetValueType(func);
 
         const entry_block = core.LLVMAppendBasicBlockInContext(llvm_ctx, func, "");
@@ -158,6 +73,8 @@ pub const CodeCompiler = struct {
         } else {
             _ = core.LLVMBuildRetVoid(builder);
         }
+
+        const vmctx = core.LLVMGetParam(func, 0);
 
         var state = State{};
         defer state.deinit(allocator);
@@ -344,6 +261,43 @@ pub const CodeCompiler = struct {
                     core.LLVMPositionBuilderAtEnd(builder, else_block);
                 },
 
+                .br_table => |br_table| {
+                    const current_block = core.LLVMGetInsertBlock(builder);
+                    const index = state.pop().?;
+
+                    const default_frame = state.frameAtDepth(br_table.default_label).?;
+                    const switch_inst = core.LLVMBuildSwitch(
+                        builder,
+                        index,
+                        default_frame.brDest(),
+                        @intCast(br_table.labels.count),
+                    );
+
+                    if (default_frame.phi()) |phi_value| {
+                        const value = state.pop().?;
+                        var values = [_]Value{value};
+                        var blocks = [_]BasicBlock{current_block};
+                        core.LLVMAddIncoming(phi_value, &values, &blocks, 1);
+                    }
+
+                    var it = br_table.labels.iter();
+                    var case_idx: u32 = 0;
+
+                    while (try it.next()) |target_label| : (case_idx += 1) {
+                        const case_value = core.LLVMConstInt(core.LLVMInt32Type(), case_idx, 0);
+                        const target_frame = state.frameAtDepth(target_label).?;
+                        core.LLVMAddCase(switch_inst, case_value, target_frame.brDest());
+
+                        if (target_frame.phi()) |phi_value| {
+                            const value = state.pop().?;
+                            var values = [_]Value{value};
+                            var blocks = [_]BasicBlock{current_block};
+                            core.LLVMAddIncoming(phi_value, &values, &blocks, 1);
+                        }
+                    }
+                    state.reachable = false;
+                },
+
                 .@"return" => {
                     const current_block = core.LLVMGetInsertBlock(builder).?;
                     const func_frame = &state.ctrl_stack.items[0];
@@ -359,7 +313,7 @@ pub const CodeCompiler = struct {
                 },
 
                 .call => |func_idx| {
-                    const callee = ctx.funcs.items[func_idx];
+                    const callee = ctx.registry.get(.{ .function = func_idx }).?;
                     const callee_type = core.LLVMGlobalGetValueType(callee);
 
                     const param_count = core.LLVMCountParams(callee);
@@ -387,37 +341,419 @@ pub const CodeCompiler = struct {
                     }
                 },
 
+                .drop => _ = state.pop(),
+                .select => {
+                    const arg3 = state.pop().?;
+                    const arg2 = state.pop().?;
+                    const arg1 = state.pop().?;
+
+                    const result = core.LLVMBuildSelect(builder, arg3, arg1, arg2, "");
+                    try state.push(allocator, result);
+                },
+
                 .@"local.get" => |local_idx| {
                     const param_count = core.LLVMCountParams(func);
-
                     if (local_idx + 1 < param_count) {
                         const local = core.LLVMGetParam(func, @intCast(local_idx + 1));
                         try state.push(allocator, local);
-                        continue;
+                    } else {
+                        try state.push(allocator, locals[local_idx - param_count - 1]);
                     }
-                    const local_ptr = locals[local_idx - (param_count - 1)];
-                    const pointee_type = core.LLVMGetAllocatedType(local_ptr);
-                    const value = core.LLVMBuildLoad2(builder, pointee_type, local_ptr, "");
-                    try state.push(allocator, value);
                 },
 
-                .@"i32.store" => |mem_arg| {
+                .@"local.set" => |local_idx| {
                     const val = state.pop().?;
-                    const addr = state.pop().?;
+                    const param_count = core.LLVMCountParams(func);
+                    if (local_idx + 1 < param_count) {
+                        const local = core.LLVMGetParam(func, @intCast(local_idx + 1));
+                        _ = core.LLVMBuildStore(builder, val, local);
+                    } else {
+                        _ = core.LLVMBuildStore(builder, val, locals[local_idx - param_count - 1]);
+                    }
+                },
 
-                    const effective_offset = core.LLVMBuildAdd(
+                .@"local.tee" => |local_idx| {
+                    const val = state.pop().?;
+                    const param_count = core.LLVMCountParams(func);
+                    if (local_idx + 1 < param_count) {
+                        const local = core.LLVMGetParam(func, @intCast(local_idx + 1));
+                        _ = core.LLVMBuildStore(builder, val, local);
+                    } else {
+                        _ = core.LLVMBuildStore(builder, val, locals[local_idx - param_count - 1]);
+                    }
+                    try state.push(allocator, val);
+                },
+
+                .@"global.get" => |global_idx| {
+                    const global = ctx.registry.get(.{ .global = global_idx }).?;
+                    try state.push(allocator, global);
+                },
+
+                .@"global.set" => |global_idx| {
+                    const val = state.pop().?;
+                    _ = core.LLVMBuildStore(builder, val, ctx.registry.get(.{ .global = global_idx }).?);
+                },
+
+                .@"i32.load" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
                         builder,
                         addr,
                         core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
                         "",
                     );
+                    var args = [_]Value{ vmctx, offset };
+                    const result = buildCall(builder, ctx.stubs.get(.get_i32), &args);
+                    try state.push(allocator, result);
+                },
 
-                    var args = [_]types.LLVMValueRef{
-                        core.LLVMGetParam(func, 0),
-                        effective_offset,
-                        val,
-                    };
+                .@"i64.load" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]Value{ vmctx, offset };
+                    const result = buildCall(builder, ctx.stubs.get(.get_i64), &args);
+                    try state.push(allocator, result);
+                },
+
+                .@"f32.load" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]Value{ vmctx, offset };
+                    const result = buildCall(builder, ctx.stubs.get(.get_f32), &args);
+                    try state.push(allocator, result);
+                },
+
+                .@"f64.load" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]Value{ vmctx, offset };
+                    const result = buildCall(builder, ctx.stubs.get(.get_f64), &args);
+                    try state.push(allocator, result);
+                },
+
+                .@"i32.load8_s" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i8), &args);
+
+                    const result = core.LLVMBuildSExt(builder, loaded, core.LLVMInt32TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i32.load8_u" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i8), &args);
+
+                    const result = core.LLVMBuildZExt(builder, loaded, core.LLVMInt32TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i32.load16_s" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i16), &args);
+
+                    const result = core.LLVMBuildSExt(builder, loaded, core.LLVMInt32TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i32.load16_u" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i16), &args);
+
+                    const result = core.LLVMBuildZExt(builder, loaded, core.LLVMInt32TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load8_s" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i8), &args);
+
+                    const result = core.LLVMBuildSExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load8_u" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i8), &args);
+
+                    const result = core.LLVMBuildZExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load16_s" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i16), &args);
+
+                    const result = core.LLVMBuildSExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load16_u" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i16), &args);
+
+                    const result = core.LLVMBuildZExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load32_s" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i32), &args);
+
+                    const result = core.LLVMBuildSExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i64.load32_u" => |mem_arg| {
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset };
+                    const loaded = buildCall(builder, ctx.stubs.get(.get_i32), &args);
+
+                    const result = core.LLVMBuildZExt(builder, loaded, core.LLVMInt64TypeInContext(llvm_ctx), "");
+                    try state.push(allocator, result);
+                },
+
+                .@"i32.store" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset, val };
                     _ = buildCall(builder, ctx.stubs.get(.set_i32), &args);
+                },
+
+                .@"i64.store" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]Value{ vmctx, offset, val };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i64), &args);
+                },
+
+                .@"f32.store" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset, val };
+                    _ = buildCall(builder, ctx.stubs.get(.set_f32), &args);
+                },
+
+                .@"f64.store" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset, val };
+                    _ = buildCall(builder, ctx.stubs.get(.set_f64), &args);
+                },
+
+                .@"i32.store8" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const val_i8 = core.LLVMBuildTrunc(
+                        builder,
+                        val,
+                        core.LLVMInt8TypeInContext(llvm_ctx),
+                        "",
+                    );
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ vmctx, offset, val_i8 };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i8), &args);
+                },
+
+                .@"i32.store16" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const val_i16 = core.LLVMBuildTrunc(
+                        builder,
+                        val,
+                        core.LLVMInt16TypeInContext(llvm_ctx),
+                        "",
+                    );
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ core.LLVMGetParam(func, 0), offset, val_i16 };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i16), &args);
+                },
+
+                .@"i64.store8" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const val_i8 = core.LLVMBuildTrunc(
+                        builder,
+                        val,
+                        core.LLVMInt8TypeInContext(llvm_ctx),
+                        "",
+                    );
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ core.LLVMGetParam(func, 0), offset, val_i8 };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i8), &args);
+                },
+
+                .@"i64.store16" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const val_i16 = core.LLVMBuildTrunc(
+                        builder,
+                        val,
+                        core.LLVMInt16TypeInContext(llvm_ctx),
+                        "",
+                    );
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ core.LLVMGetParam(func, 0), offset, val_i16 };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i16), &args);
+                },
+
+                .@"i64.store32" => |mem_arg| {
+                    const val = state.pop().?;
+                    const addr = state.pop().?;
+                    const val_i32 = core.LLVMBuildTrunc(
+                        builder,
+                        val,
+                        core.LLVMInt16TypeInContext(llvm_ctx),
+                        "",
+                    );
+                    const offset = core.LLVMBuildAdd(
+                        builder,
+                        addr,
+                        core.LLVMConstInt(core.LLVMInt32TypeInContext(llvm_ctx), mem_arg.offset, 0),
+                        "",
+                    );
+                    var args = [_]types.LLVMValueRef{ core.LLVMGetParam(func, 0), offset, val_i32 };
+                    _ = buildCall(builder, ctx.stubs.get(.set_i32), &args);
+                },
+
+                .@"memory.size" => |_| {
+                    var args = [_]Value{vmctx};
+                    const result = buildCall(builder, ctx.stubs.get(.memory_size), &args);
+                    try state.push(allocator, result);
+                },
+
+                .@"memory.grow" => |_| {
+                    const delta = state.pop().?;
+                    var args = [_]Value{ vmctx, delta };
+                    const result = buildCall(builder, ctx.stubs.get(.memory_grow), &args);
+                    try state.push(allocator, result);
                 },
 
                 .@"i32.const" => |value| {

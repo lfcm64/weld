@@ -241,18 +241,18 @@ pub const MemArg = struct {
 
 pub const Instruction = union(Opcode) {
     //Control
-    @"unreachable", //
-    nop, //
-    block: BlockType, //
-    loop: BlockType, //
-    @"if": BlockType, //
-    @"else", //
-    end, //
-    br: u32, //
-    br_if: u32, //
+    @"unreachable",
+    nop,
+    block: BlockType,
+    loop: BlockType,
+    @"if": BlockType,
+    @"else",
+    end,
+    br: u32,
+    br_if: u32,
     br_table: BrTable,
-    @"return", //
-    call: u32, //
+    @"return",
+    call: u32,
     call_indirect: CallIndirect,
 
     //Parametric

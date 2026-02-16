@@ -8,47 +8,52 @@ const Stubs = @import("codegen/stubs.zig").Stubs;
 
 const types = llvm.types;
 const core = llvm.core;
+const orc = llvm.orc;
 
 const Allocator = std.mem.Allocator;
+const Value = types.LLVMValueRef;
+const Type = types.LLVMTypeRef;
+
+pub const Symbol = union(enum) {
+    global: u32,
+    function: u32,
+};
+pub const SymbolRegistry = std.AutoHashMapUnmanaged(Symbol, Value);
+
+pub const CompilerCounts = struct {
+    imported_funcs: u32 = 0,
+};
 
 allocator: Allocator,
 
-llvm_module: types.LLVMModuleRef,
-llvm_context: types.LLVMContextRef,
+module: types.LLVMModuleRef,
+context: types.LLVMContextRef,
+
+registry: SymbolRegistry = .{},
+functypes: std.ArrayList(Type) = .{},
 
 intrinsics: Intrinsics,
 stubs: Stubs,
 
-functypes: std.ArrayList(types.LLVMTypeRef) = .{},
-funcs: std.ArrayList(types.LLVMValueRef) = .{},
+counts: CompilerCounts = .{},
 
-imported_funcs: u32 = 0,
+pub fn init(allocator: Allocator, tsctx: orc.LLVMOrcThreadSafeContextRef) !Context {
+    const ctx = orc.LLVMOrcThreadSafeContextGetContext(tsctx);
+    errdefer core.LLVMContextDispose(ctx);
 
-pub fn init(allocator: Allocator) Context {
-    const ctx = core.LLVMContextCreate();
     const module = core.LLVMModuleCreateWithNameInContext("", ctx);
-    const intrinsics = Intrinsics.init(module, ctx);
-    const stubs = Stubs.init(module, ctx);
+    errdefer core.LLVMDisposeModule(module);
+
     return .{
         .allocator = allocator,
-        .llvm_module = module,
-        .llvm_context = ctx,
-        .intrinsics = intrinsics,
-        .stubs = stubs,
+        .module = module,
+        .context = ctx,
+        .intrinsics = Intrinsics.init(module, ctx),
+        .stubs = Stubs.init(module, ctx),
     };
 }
 
 pub fn deinit(self: *Context) void {
-    core.LLVMContextDispose(self.llvm_context);
-
     self.functypes.deinit(self.allocator);
-    self.funcs.deinit(self.allocator);
-}
-
-pub fn addType(self: *Context, ty: types.LLVMTypeRef) !void {
-    try self.functypes.append(self.allocator, ty);
-}
-
-pub fn addFunc(self: *Context, func: types.LLVMValueRef) !void {
-    try self.funcs.append(self.allocator, func);
+    self.registry.deinit(self.allocator);
 }

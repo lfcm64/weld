@@ -2,83 +2,64 @@ const Compiler = @This();
 
 const std = @import("std");
 const wasm = @import("wasm");
+const llvm = @import("llvm");
 
-const function = @import("codegen/function.zig");
-const code = @import("codegen/code.zig");
-
+const Ast = @import("../parser/Ast.zig");
 const Context = @import("Context.zig");
-const Event = @import("../parser/event.zig").Event;
+const CodegenBuilder = @import("codegen/codegen.zig").CodegenBuilder;
 
-const sections = wasm.sections;
+const types = llvm.types;
+const orc = llvm.orc;
+const jit = llvm.jit;
+const errors = llvm.errors;
 
 const Allocator = std.mem.Allocator;
-const Section = sections.Section;
 
-ctx: Context,
+pub const Config = struct {};
 
-pub fn init(allocator: Allocator) Compiler {
-    return .{ .ctx = Context.init(allocator) };
-}
+config: Config = .{},
 
-pub fn deinit(self: *Compiler) void {
-    self.ctx.deinit();
-}
+pub const Code = struct {
+    lljit: types.LLVMOrcLLJITRef,
+    dylib: orc.LLVMOrcJITDylibRef,
+};
 
-pub fn onEvent(self: *Compiler, event: Event) !void {
-    switch (event) {
-        .type_section => |section| try self.compileTypeSection(section),
-        .func_section => |section| try self.compileFuncSection(section),
-        .export_section => |section| try self.compileExportSection(section),
-        .code_section => |section| try self.compileCodeSection(section),
-        else => {},
+pub fn compile(_: Compiler, allocator: Allocator, ast: Ast) !Code {
+    _ = llvm.target.LLVMInitializeNativeTarget();
+    _ = llvm.target.LLVMInitializeNativeAsmPrinter();
+    _ = llvm.target.LLVMInitializeNativeAsmParser();
+
+    const tsctx = orc.LLVMOrcCreateNewThreadSafeContext();
+    defer orc.LLVMOrcDisposeThreadSafeContext(tsctx);
+
+    var ctx = try Context.init(allocator, tsctx);
+
+    var builder = CodegenBuilder{ .ctx = &ctx };
+    try ast.traverse(builder.visitor());
+
+    const llvm_mod = builder.finish();
+
+    const jit_builder = jit.LLVMOrcCreateLLJITBuilder();
+
+    var lljit: types.LLVMOrcLLJITRef = null;
+    const create_err = jit.LLVMOrcCreateLLJIT(&lljit, jit_builder);
+    if (create_err != null) {
+        errors.LLVMConsumeError(create_err);
+        return error.LlvmError;
     }
-}
+    errdefer _ = jit.LLVMOrcDisposeLLJIT(lljit);
 
-fn ItemCompiler(comptime section_type: sections.SectionType) type {
-    return *const fn (ctx: *Context, item: sections.SectionItem(section_type), idx: u32) anyerror!void;
-}
+    const tsm = orc.LLVMOrcCreateNewThreadSafeModule(llvm_mod, tsctx);
+    const dylib = jit.LLVMOrcLLJITGetMainJITDylib(lljit);
 
-fn compileEach(
-    self: *Compiler,
-    comptime section_type: sections.SectionType,
-    section: Section(section_type),
-    compile_item: ItemCompiler(section_type),
-) !void {
-    var it = section.iter();
-    var i: u32 = 0;
-    while (try it.next()) |item| : (i += 1) {
-        try compile_item(&self.ctx, item, i);
+    const add_err = jit.LLVMOrcLLJITAddLLVMIRModule(lljit, dylib, tsm);
+    if (add_err != null) {
+        errors.LLVMConsumeError(add_err);
+        return error.LlvmError;
     }
-}
 
-fn compileTypeSection(self: *Compiler, section: Section(.type)) !void {
-    try self.compileEach(
-        .type,
-        section,
-        function.FunctionTypeCompiler.compile,
-    );
-}
-
-fn compileFuncSection(self: *Compiler, section: Section(.func)) !void {
-    try self.compileEach(
-        .func,
-        section,
-        function.FunctionCompiler.compile,
-    );
-}
-
-fn compileExportSection(self: *Compiler, section: Section(.@"export")) !void {
-    try self.compileEach(
-        .@"export",
-        section,
-        function.ExportCompiler.compile,
-    );
-}
-
-fn compileCodeSection(self: *Compiler, section: Section(.code)) !void {
-    try self.compileEach(
-        .code,
-        section,
-        code.CodeCompiler.compile,
-    );
+    return Code{
+        .lljit = lljit,
+        .dylib = dylib,
+    };
 }
